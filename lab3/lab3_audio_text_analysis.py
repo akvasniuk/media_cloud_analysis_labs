@@ -88,6 +88,23 @@ def search_phrase_and_entities(text, phrase):
     entities = [(ent.text, ent.label_) for ent in doc.ents]
     return phrase_result, entities
 
+def save_results_to_file(filename, transcript, lang, sentiment, phrase_result, entities):
+    """Save analysis results to a text file in the requested structure"""
+    output_file = filename.replace(".wav", "_analysis.txt")
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write("Transcription:\n")
+        f.write(transcript + "\n\n")
+        f.write(f"Language:\n{lang}\n\n")
+        f.write(f"Sentiment:\n{sentiment}\n\n")
+        f.write(f"{phrase_result}\n\n")
+        f.write("Named entities:\n")
+        if entities:
+            for text, label in entities:
+                f.write(f"  - {text} ({label})")
+        else:
+            f.write("  None\n")
+    print(f"\n Analysis saved to {output_file}")
+
 def main():
     parser = argparse.ArgumentParser(description="Audio transcription and analysis tool.")
     parser.add_argument("--audio-source", required=True, help="Path to WAV audio file")
@@ -114,6 +131,8 @@ def main():
             print(f"  - {text} ({label})")
     else:
         print("No named entities found.")
+    
+    save_results_to_file(args.audio_source, transcript, lang, sentiment, phrase_result, entities)
 
 if __name__ == "__main__":
     main()

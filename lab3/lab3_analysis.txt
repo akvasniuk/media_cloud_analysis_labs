@@ -1,0 +1,13 @@
+Transcription:
+Nasa has launched a new rocket. It was fantastic.
+
+Language:
+en
+
+Sentiment:
+Positive
+
+Phrase FOUND: "It was fantastic" (tokens 7-10, chars 32-48)
+
+Named entities:
+  - Nasa (ORG)
