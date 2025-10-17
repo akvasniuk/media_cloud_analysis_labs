@@ -1,0 +1,453 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Audio Transcribe
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+    Description: Stage name for API Gateway
+
+  ExistingBucketName:
+    Type: String
+    Description: Name of the existing S3 bucket
+
+  DeepgramApiKey:
+    Type: String
+    NoEcho: true
+    Description: Your Deepgram API Key
+
+Resources:
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: LambdaS3Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ExistingBucketName}"
+                  - !Sub "arn:aws:s3:::${ExistingBucketName}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # Lambda: Generate Key
+  GenerateKeyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GenerateKeyLambda
+      Runtime: python3.10
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 15
+      MemorySize: 128
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref ExistingBucketName
+      Code:
+        ZipFile: |
+          import json, uuid, boto3, os, re
+
+          s3 = boto3.client("s3")
+          BUCKET = os.environ["BUCKET_NAME"]
+
+          EMAIL_REGEX = r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+
+          def lambda_handler(event, context):
+              try:
+                  body = json.loads(event.get("body", "{}"))
+                  email = body.get("email")
+
+                  if not email:
+                      return {
+                          "statusCode": 400,
+                          "body": json.dumps({"error": "Email required"})
+                      }
+
+                  if not re.match(EMAIL_REGEX, email):
+                      return {
+                          "statusCode": 400,
+                          "body": json.dumps({"error": "Invalid email format"})
+                      }
+
+                  prefix = f"{email}_"
+                  response = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix, MaxKeys=1)
+
+                  if response.get("KeyCount", 0) > 0:
+                      existing_key = response["Contents"][0]["Key"]
+                      token = existing_key.split("_", 1)[1].rstrip("/")
+                  else:
+                      token = str(uuid.uuid4())
+                      folder_name = f"{email}_{token}/"
+                      s3.put_object(Bucket=BUCKET, Key=folder_name)
+
+                  return {
+                      "statusCode": 200,
+                      "headers": {"Content-Type": "application/json"},
+                      "body": json.dumps({"token": token})
+                  }
+
+              except Exception as e:
+                  return {
+                      "statusCode": 500,
+                      "headers": {"Content-Type": "application/json"},
+                      "body": json.dumps({"error": str(e)})
+                  }
+
+  ### === Transcribe Lambda ===
+  TranscribeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-transcribe"
+      Handler: index.lambda_handler
+      Runtime: python3.10
+      Timeout: 120
+      MemorySize: 512
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref ExistingBucketName
+          DEEPGRAM_API_KEY: !Ref DeepgramApiKey
+      Layers: 
+        - arn:aws:lambda:us-east-1:642825398845:layer:ImportLayer:2
+      Code:
+        ZipFile: |
+          import json, os, uuid, boto3, requests, base64, re, nltk, langid
+          from nltk.sentiment.vader import SentimentIntensityAnalyzer
+          from email.parser import BytesParser
+          from email.policy import default
+          import cgi
+          import io
+          
+          nltk.data.path.append("/opt/python/nltk_data")
+          
+          s3 = boto3.client("s3")
+          BUCKET = os.environ["BUCKET_NAME"]
+          DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
+          DEEPGRAM_API_URL = "https://api.deepgram.com/v1/listen"
+          DEEPGRAM_UNDERSTANDING_URL = "https://api.deepgram.com/v1/read?topics=true&sentiment=true&summary=true&key_phrases=true"
+          
+          headers = {
+              "Authorization": f"Token {DEEPGRAM_API_KEY}",
+              "Content-Type": "application/json"
+          }
+          
+          SUPPORTED_MEDIA_TYPES = {
+              "audio/wav": "wav",
+              "audio/mpeg": "mp3",
+          }
+          
+          def parse_multipart(event):
+              params = event.get("queryStringParameters") or {}
+              token = params.get("token")
+              if "body" not in event or not event["body"]:
+                  raise ValueError("Missing body in the event")
+              content_type = event["headers"].get("content-type") or event["headers"].get("Content-Type")
+              if not content_type or "boundary=" not in content_type:
+                  raise ValueError("Missing or invalid Content-Type header with boundary")
+              if event.get("isBase64Encoded", False):
+                  body_bytes = base64.b64decode(event["body"])
+              else:
+                  body_bytes = event["body"].encode("latin1")
+              fp = io.BytesIO(body_bytes)
+              environ = {"REQUEST_METHOD": "POST"}
+              headers = {"content-type": content_type}
+              fs = cgi.FieldStorage(fp=fp, environ=environ, headers=headers)
+              audio_bytes = None
+              filename = None
+              if "token" in fs and not token:
+                  token = fs["token"].value.strip()
+              for key in fs:
+                  item = fs[key]
+                  if item.filename:
+                      filename = item.filename
+                      audio_bytes = item.file.read()
+                      break
+              if not token:
+                  raise ValueError("Missing token in form-data")
+              if not audio_bytes:
+                  raise ValueError("Missing audio file in form-data")
+              return token, filename, audio_bytes
+          
+          def validate_token(token):
+              resp = s3.list_objects_v2(Bucket=BUCKET, Prefix="", MaxKeys=1000)
+              for obj in resp.get("Contents", []):
+                  key = obj["Key"]
+                  if key.endswith(f"_{token}/") or f"_{token}/" in key:
+                      return key.rsplit("/", 1)[0] + "/"
+              raise Exception("Invalid token")
+          
+          def transcribe_with_deepgram(filename, audio_bytes):
+              if filename.lower().endswith(".wav"):
+                  content_type = "audio/wav"
+              elif filename.lower().endswith(".mp3"):
+                  content_type = "audio/mpeg"
+              else:
+                  content_type = "application/octet-stream"
+              headers = {
+                  "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                  "Content-Type": content_type
+              }
+              response = requests.post(
+                  DEEPGRAM_API_URL,
+                  headers=headers,
+                  data=audio_bytes,
+                  params={"punctuate": "true", "language": "en"}
+              )
+              if response.status_code != 200:
+                  raise Exception(f"Deepgram API error: {response.text}")
+              result = response.json()
+              return result["results"]["channels"][0]["alternatives"][0]["transcript"]
+          
+          def detect_language(text):
+              lang, conf = langid.classify(text)
+              return lang
+          
+          def analyze_sentiment(text):
+              analyzer = SentimentIntensityAnalyzer()
+              scores = analyzer.polarity_scores(text)
+              compound = scores["compound"]
+              if compound >= 0.05:
+                  sentiment = "Positive"
+              elif compound <= -0.05:
+                  sentiment = "Negative"
+              else:
+                  sentiment = "Neutral"
+              return {"compound": compound, "sentiment": sentiment}
+          
+          def search_phrase_with_regex(text, phrase):
+              pattern = r"\b" + re.escape(phrase) + r"\b"
+              match = re.search(pattern, text, re.IGNORECASE)
+              if match:
+                  return {"found": True, "text": match.group(0), "start_char": match.start(), "end_char": match.end()}
+              return {"found": False}
+          
+          def deepgram_understanding(text):
+              data = {"text": text}
+              response = requests.post(DEEPGRAM_UNDERSTANDING_URL, headers=headers, json=data)
+              if response.status_code != 200:
+                  return {}
+              result = response.json()
+              topics = []
+              try:
+                  for seg in result["results"]["topics"]["segments"]:
+                      for t in seg["topics"]:
+                          topics.append(t["topic"])
+              except Exception:
+                  pass
+              return {"raw": result, "topics": topics}
+          
+          def lambda_handler(event, context):
+              try:
+                  params = event.get("queryStringParameters") or {}
+                  phrase = params.get("phrase", "example")
+                  token, filename, audio_bytes = parse_multipart(event)
+                  user_prefix = validate_token(token)
+                  file_id = str(uuid.uuid4())
+                  transcript = transcribe_with_deepgram(filename, audio_bytes)
+                  lang = detect_language(transcript)
+                  sentiment_data = analyze_sentiment(transcript)
+                  phrase_result = search_phrase_with_regex(transcript, phrase)
+                  understanding_data = deepgram_understanding(transcript)
+                  result_json = {
+                      "file_id": file_id,
+                      "language": lang,
+                      "sentiment": sentiment_data,
+                      "phrase_search": phrase_result,
+                      "topics": understanding_data.get("topics", []),
+                      "transcript": transcript
+                  }
+                  result_text = (
+                      f"Transcription:\n{transcript}\n\n"
+                      f"Language: {lang}\n"
+                      f"Sentiment: {sentiment_data['sentiment']} ({sentiment_data['compound']})\n"
+                      f"Phrase: {'FOUND' if phrase_result['found'] else 'NOT FOUND'}\n\n"
+                      f"Topics: {', '.join(understanding_data.get('topics', [])) or 'None'}"
+                  )
+                  s3.put_object(
+                      Bucket=BUCKET,
+                      Key=f"{user_prefix}{file_id}_{filename}_analysis.txt",
+                      Body=result_text.encode("utf-8"),
+                      ContentType="text/plain"
+                  )
+                  return {
+                      "statusCode": 200,
+                      "headers": {"Content-Type": "application/json"},
+                      "body": json.dumps(result_json, ensure_ascii=False)
+                  }
+              except Exception as e:
+                  return {
+                      "statusCode": 400 if "Invalid token" in str(e) else 500,
+                      "headers": {"Content-Type": "application/json"},
+                      "body": json.dumps({"error": str(e)})
+                  }
+
+
+  ### === History Lambda ===
+  HistoryLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-history"
+      Handler: index.lambda_handler
+      Runtime: python3.10
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref ExistingBucketName
+      Code:
+        ZipFile: |
+          import json, os, boto3, re
+
+          s3 = boto3.client("s3")
+          BUCKET = os.environ["BUCKET_NAME"]
+
+          def lambda_handler(event, context):
+              params = event.get("queryStringParameters") or {}
+              token = params.get("token")
+              if not token:
+                  return {"statusCode": 400, "body": json.dumps({"error": "Token required"})}
+
+              response = s3.list_objects_v2(Bucket=BUCKET, Prefix="")
+              user_folder = None
+              if "Contents" in response:
+                  for obj in response["Contents"]:
+                      key = obj["Key"]
+                      if re.match(r".+_" + re.escape(token) + r"/", key):
+                          user_folder = key.split("/")[0] + "/"
+                          break
+
+              if not user_folder:
+                  return {"statusCode": 404, "body": json.dumps({"error": "User folder not found"})}
+
+              response = s3.list_objects_v2(Bucket=BUCKET, Prefix=user_folder)
+              if "Contents" not in response:
+                  return {"statusCode": 404, "body": json.dumps({"error": "No transcripts found"})}
+
+              files = [obj["Key"].split("/")[-1] for obj in response["Contents"]]
+              return {"statusCode": 200, "body": json.dumps({"transcripts": files})}
+
+  ### === API Gateway ===
+  DeepgramApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-deepgram-api"
+      BinaryMediaTypes:
+        - "audio/wav"
+        - "audio/mpeg"
+        - "multipart/form-data"
+
+  ### Resources for endpoints
+  GenerateKeyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DeepgramApi
+      ParentId: !GetAtt DeepgramApi.RootResourceId
+      PathPart: generate-key
+
+  TranscribeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DeepgramApi
+      ParentId: !GetAtt DeepgramApi.RootResourceId
+      PathPart: transcribe
+
+  HistoryResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DeepgramApi
+      ParentId: !GetAtt DeepgramApi.RootResourceId
+      PathPart: history
+
+  ### Methods
+  GenerateKeyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DeepgramApi
+      ResourceId: !Ref GenerateKeyResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GenerateKeyLambda.Arn}/invocations
+
+  TranscribeMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DeepgramApi
+      ResourceId: !Ref TranscribeResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TranscribeLambda.Arn}/invocations
+
+  HistoryMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DeepgramApi
+      ResourceId: !Ref HistoryResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HistoryLambda.Arn}/invocations
+
+  ### Lambda permissions for API Gateway
+  PermissionGenerateKey:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GenerateKeyLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  PermissionTranscribe:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TranscribeLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  PermissionHistory:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HistoryLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+   
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GenerateKeyMethod
+      - TranscribeMethod
+      - HistoryMethod
+    Properties:
+      RestApiId: !Ref DeepgramApi
+      StageName: !Ref StageName
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of API
+    Value: !Sub "https://${DeepgramApi}.execute-api.${AWS::Region}.amazonaws.com/prod/"
