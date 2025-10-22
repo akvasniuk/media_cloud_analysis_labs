@@ -128,7 +128,7 @@ curl -X POST "https://{api_id}.execute-api.{region}.amazonaws.com/prod/transcrib
 ***POST /history***
 
 **Description:**  
-Returns a list of all audio files and transcripts associated with a user token.
+Returns a list of all transcripts associated with a user token.
 
 
 **Request:** token via query parameter
